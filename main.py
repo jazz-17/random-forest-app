@@ -1,220 +1,218 @@
-import numpy as np
-import pandas as pd
-from typing import Tuple
-from flask import Flask, json, jsonify, render_template, request, redirect, url_for
-import os
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-import joblib
+# app.py (or your main flask file)
 import logging
-from  flask_cors import CORS
+import os
+from flask import Flask, json, jsonify, render_template, request, redirect, url_for
+from flask_cors import CORS
+import pandas as pd  # Keep for potential type checking if needed
 
+# Import the service
+from ml_service import MLService, MODEL_DIR  # Import MODEL_DIR if needed elsewhere
 
-# Configure logging
+# Configure logging (basic setup)
 logging.basicConfig(
-    level=logging.DEBUG,  # Set to DEBUG to capture detailed logs
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+# Get logger for this module
+logger = logging.getLogger(__name__)
 
-template_dir = os.path.abspath("./dist")
 app = Flask(__name__, template_folder="dist", static_folder="dist/assets")
-CORS(app)
+CORS(app)  # Enable CORS for all routes
+
+# Instantiate the ML Service
+# Can be global if stateless, or created per request if stateful
+ml_service = MLService(model_dir=MODEL_DIR)
+
 
 # Serve the homepage
 @app.route("/")
 def home():
+    # No change needed here
     return render_template("index.html")
 
 
-# Route for file upload
+# Route for file upload inspection
 @app.route("/api/upload", methods=["POST"])
 def upload_file():
+    if "file" not in request.files:
+        logger.warning("Upload request received with no file part.")
+        return jsonify({"error": "No hay ningun archivo en la solicitud"}), 400
+
+    file = request.files["file"]
+    if not file or file.filename == "":
+        logger.warning("Upload request received with empty filename.")
+        return jsonify({"error": "No file selected."}), 400
+
+    # Basic filename check (service layer does more robust format check)
+    if not file.filename.lower().endswith((".xls", ".xlsx", ".csv")):
+        logger.warning(f"Invalid file format uploaded: {file.filename}")
+        return (
+            jsonify(
+                {
+                    "error": "Formato de archivo no válido. Cargue un archivo .xls, .xlsx o .csv."
+                }
+            ),
+            400,
+        )
+
     try:
+        # Delegate the core logic to the service
+        result = ml_service.inspect_file(file)
+        logger.info(f"File inspection successful for {file.filename}")
+        return jsonify(result), 200
+
+    except ValueError as e:  # Catch specific errors from service
+        logger.error(f"Value error during file inspection: {e}")
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.exception(
+            f"Unexpected error during file inspection for {file.filename}"
+        )  # Log full traceback
+        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+
+
+@app.route("/api/train", methods=["POST"])
+def train_model_route():
+    logger.info("Received request for model training.")
+    try:
+        # --- Parameter Extraction and Validation ---
         if "file" not in request.files:
-            return jsonify({"error": "No hay ningun archivo en la solicitud"}), 400
-
+            logger.error("Training request missing file.")
+            return jsonify({"error": "No file provided for training."}), 400
         file = request.files["file"]
+        if not file or file.filename == "":
+            logger.error("Training request received with empty filename.")
+            return jsonify({"error": "No file selected for training."}), 400
 
-        if not file.filename.endswith((".xls", ".xlsx", ".csv")):
+        num_trees_str = request.form.get("numTrees", "100")
+        max_depth_str = request.form.get("maxDepth")
+        missing_values_option = request.form.get("missingValuesOption", "drop").strip(
+            '"'
+        )
+        selected_columns_json = request.form.get("selectedColumns")
+
+        try:
+            num_trees = int(num_trees_str)
+            if num_trees <= 0:
+                raise ValueError("Number of trees must be positive.")
+        except ValueError:
+            logger.error(f"Invalid numTrees value: {num_trees_str}")
+            return jsonify({"error": "Invalid value for number of trees."}), 400
+
+        max_depth = None
+        if max_depth_str and max_depth_str.lower() != "none" and max_depth_str != "":
+            try:
+                max_depth = int(max_depth_str)
+                if max_depth <= 0:
+                    raise ValueError("Max depth must be positive.")
+            except ValueError:
+                logger.error(f"Invalid maxDepth value: {max_depth_str}")
+                return jsonify({"error": "Invalid value for max depth."}), 400
+
+        selected_columns = None
+        if selected_columns_json and selected_columns_json.lower() != "null":
+            try:
+                selected_columns = json.loads(selected_columns_json)
+                if not isinstance(selected_columns, list):
+                    raise ValueError("selectedColumns must be a list.")
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(
+                    f"Invalid selectedColumns JSON: {selected_columns_json} - {e}"
+                )
+                return jsonify({"error": "Invalid format for selected columns."}), 400
+
+        # --- Delegate to Service ---
+        logger.debug(
+            f"Training parameters: num_trees={num_trees}, max_depth={max_depth}, missing_opt={missing_values_option}, columns={selected_columns}"
+        )
+        result = ml_service.train(
+            file=file,
+            selected_columns=selected_columns,
+            missing_values_option=missing_values_option,
+            num_trees=num_trees,
+            max_depth=max_depth,
+        )
+        logger.info(
+            f"Training successful. Model ID: {result['modelId']}, Accuracy: {result['accuracy']:.4f}"
+        )
+        return jsonify(result), 200
+
+    except (
+        FileNotFoundError,
+        ValueError,
+        TypeError,
+        IOError,
+    ) as e:  # Catch specific errors
+        logger.error(f"Error during model training request: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 400  # Or 500 depending on error type
+    except RuntimeError as e:  # Catch unexpected runtime errors from service
+        logger.exception("Runtime error during model training request.")
+        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        logger.exception("Unexpected error during model training request.")
+        return jsonify({"error": f"An unexpected server error occurred: {str(e)}"}), 500
+
+
+@app.route("/api/test", methods=["POST"])
+def test_model_route():
+    logger.info("Received request for model prediction.")
+    try:
+        # --- Parameter Extraction and Validation ---
+        model_path = request.form.get("modelPath")
+        input_data_json = request.form.get("inputData")
+
+        if not model_path or not input_data_json:
+            logger.warning("Prediction request missing modelPath or inputData.")
+            return (
+                jsonify({"error": "Missing required fields: modelPath and inputData."}),
+                400,
+            )
+
+        try:
+            input_data = json.loads(input_data_json)
+            if not isinstance(input_data, dict):
+                raise ValueError("inputData must be a JSON object (dictionary).")
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Invalid inputData JSON: {input_data_json} - {e}")
             return (
                 jsonify(
-                    {
-                        "error": "Formato de archivo no válido. Cargue un archivo .xls, .xlsx o .csv."
-                    }
+                    {"error": "Invalid format for input data. Expected a JSON object."}
                 ),
                 400,
             )
 
-        if file.filename.endswith(".csv"):
-            df = pd.read_csv(file)
-        else:
-            df = pd.read_excel(file)
+        # --- Delegate to Service ---
+        logger.debug(
+            f"Prediction request: model_path={model_path}, input_data={input_data}"
+        )
+        result = ml_service.predict(model_path=model_path, input_data=input_data)
+        logger.info(f"Prediction successful for model {model_path}.")
+        return jsonify(result), 200
 
-        columns = df.columns.tolist()
-        rows = df.head(10).values.tolist()
-
-        categorical = [
-            col for col in df.select_dtypes(include=["object"]).columns.tolist()
-        ]
-
-        response_data = {
-            "columns": columns,
-            "rows": rows,
-            "categorical": categorical,
-        }
-        response = jsonify(response_data)
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        return response, 200
-
-    except Exception as e:
+    except (
+        FileNotFoundError,
+        ValueError,
+        TypeError,
+        IOError,
+    ) as e:  # Catch specific errors
+        logger.error(f"Error during prediction request: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 400  # Or 500
+    except RuntimeError as e:  # Catch unexpected runtime errors from service
+        logger.exception("Runtime error during prediction request.")
         return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/train", methods=["POST"])
-def train_model():
-    try:
-        logging.info("Received a training request")
-
-        # Log request headers and body for debugging
-        logging.debug(f"Request headers: {request.headers}")
-        logging.debug(f"Request form data: {request.form}")
-        logging.debug(f"Request files: {request.files}")
-
-        # Retrieve parameters
-        num_trees = int(request.form.get("numTrees", 100))
-        max_depth = (
-            int(request.form.get("maxDepth", None))
-            if request.form.get("maxDepth")
-            else None
-        )
-        # Sanitize the missingValuesOption
-        missing_values_option = request.form.get("missingValuesOption", "drop").strip(
-            '"'
-        )
-        selected_columns = request.form.get("selectedColumns", None)
-        file = request.files.get("file")
-
-        if not file:
-            logging.error("No file provided in the request.")
-            return jsonify({"error": "No file provided for training."}), 400
-
-        # Process the uploaded file
-        if file.filename.endswith(".csv"):
-            logging.info("Processing CSV file.")
-            df = pd.read_csv(file)
-        else:
-            logging.info("Processing Excel file.")
-            df = pd.read_excel(file)
-
-        selected_columns = (
-            json.loads(selected_columns) if selected_columns else df.columns.tolist()
-        )
-        logging.debug(f"Selected columns for training: {selected_columns}")
-        df = df[selected_columns]
-
-        # Handle missing values
-        if missing_values_option == "drop":
-            logging.info("Dropping rows with missing values.")
-            df = df.dropna()
-        elif missing_values_option == "mean":
-            logging.info("Filling missing values with column means.")
-            df = df.fillna(df.mean(numeric_only=True))
-        elif missing_values_option == "median":
-            logging.info("Filling missing values with column medians.")
-            df = df.fillna(df.median(numeric_only=True))
-        else:
-            logging.error(f"Invalid missing values option: {missing_values_option}")
-            return jsonify({"error": "Invalid missing values option."}), 400
-
-        # Encode categorical columns
-        categorical_columns = df.select_dtypes(include=["object"]).columns.tolist()
-        logging.debug(f"Categorical columns: {categorical_columns}")
-        encoders = {}
-        for col in categorical_columns:
-            le = LabelEncoder()
-            df[col] = le.fit_transform(df[col].astype(str))
-            encoders[col] = le  # Save the encoder
-
-        # Split the data
-        X = df.iloc[:, :-1]
-        y = df.iloc[:, -1]
-        logging.debug("Data split into features and target.")
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
-        )
-        logging.info("Training and test data split.")
-
-        # Train the model
-        model = RandomForestClassifier(
-            n_estimators=num_trees, max_depth=max_depth, random_state=42
-        )
-        model.fit(X_train, y_train)
-        logging.info("RandomForest model trained successfully.")
-
-        # Evaluate the model
-        accuracy = model.score(X_test, y_test)
-        logging.info(f"Model accuracy: {accuracy}")
-
-        # Save the model
-        model_path = f"models/random_forest_{num_trees}_{max_depth or 'none'}.pkl"
-        joblib.dump((model, encoders), model_path)
-        logging.info(f"Model saved to {model_path}")
-
-        response = jsonify({"modelId": model_path, "accuracy": accuracy})
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        return response, 200
-
     except Exception as e:
-        logging.exception("An error occurred during the training process.")
-        return jsonify({"error": str(e)}), 500
+        logger.exception("Unexpected error during prediction request.")
+        return jsonify({"error": f"An unexpected server error occurred: {str(e)}"}), 500
 
-
-@app.route("/api/test", methods=["POST"])
-def test_model():
-    try:
-        logging.info("Received a prediction request.")
-        model_path = request.form.get("modelPath")
-        input_data = request.form.get("inputData")
-
-        if not model_path or not input_data:
-            return jsonify({"error": "Missing required fields."}), 400
-
-        input_data = json.loads(input_data) if isinstance(input_data, str) else input_data
-        input_df = pd.DataFrame([input_data])
-
-        # Load model and encoders
-        try:
-            model, encoders = joblib.load(model_path)
-        except Exception as e:
-            logging.error(f"Error loading model: {str(e)}")
-            return jsonify({"error": "Failed to load model."}), 500
-
-        # Encode categorical features
-        for col, le in encoders.items():
-            if col in input_df:
-                try:
-                    input_df[col] = le.transform(input_df[col].astype(str))
-                except ValueError:
-                    return jsonify({"error": f"Invalid value in column '{col}'."}), 400
-
-        # Validate features
-        expected_features = model.feature_names_in_
-        if not all(feature in input_df.columns for feature in expected_features):
-            return jsonify({"error": "Input features do not match model requirements."}), 400
-
-        input_df = input_df[expected_features]
-
-        # Make predictions
-        predictions = model.predict(input_df)
-        probabilities = model.predict_proba(input_df).tolist()
-
-        return jsonify({"predictions": predictions.tolist(), "probabilities": probabilities}), 200
-
-    except Exception as e:
-        logging.exception("An error occurred during prediction.")
-        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Make sure the model directory exists (redundant if MLService is imported, but safe)
+    if not os.path.exists(MODEL_DIR):
+        os.makedirs(MODEL_DIR)
+    # Use debug=False for production, True for development
+    # Use host='0.0.0.0' to make it accessible on your network
+    app.run(
+        debug=os.environ.get("FLASK_DEBUG", "False").lower() == "true",
+        host="0.0.0.0",
+        port=5000,
+    )
